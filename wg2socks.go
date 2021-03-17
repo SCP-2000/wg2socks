@@ -2,42 +2,62 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/hex"
 	"flag"
-	"fmt"
 	"github.com/armon/go-socks5"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
+	"io/ioutil"
 	"log"
 	"net"
 )
 
 func main() {
-	var localIPs, dnsIPs IPSlice
-	var mtu int
-	var privateKey, publicKey, endpoint, listen string
-
-	flag.Var(&localIPs, "ip", "list of local ip address")
-	flag.Var(&dnsIPs, "dns", "list of dns ip address")
-	flag.IntVar(&mtu, "mtu", 1280, "interface mtu")
-	flag.StringVar(&privateKey, "key", "", "wireguard private key")
-	flag.StringVar(&publicKey, "pub", "", "wireguard public key of peer")
-	flag.StringVar(&endpoint, "endpoint", "", "wireguard endpoint of peer")
-	flag.StringVar(&listen, "listen", "", "listen address of socks5 server")
+	configFile := flag.String("c", "wg.yaml", "path to wg-quick config")
 	flag.Parse()
 
-	tun, tnet, err := netstack.CreateNetTUN(localIPs, dnsIPs, mtu)
+	confData, err := ioutil.ReadFile(*configFile)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelError, ""))
-	if err = dev.IpcSet(fmt.Sprintf("private_key=%s", base64hex(privateKey))); err != nil {
+	cfg, err := ConfigFromYAML(confData)
+	if err != nil {
 		log.Fatal(err)
 	}
-	if err = dev.IpcSet(fmt.Sprintf("public_key=%s\nendpoint=%s\nallowed_ip=0.0.0.0/0\nallowed_ip=::/0", base64hex(publicKey), endpoint)); err != nil {
+
+	var localAddr []net.IP
+	for _, cidr := range cfg.Interface.Address {
+		localAddr = append(localAddr, cidr.IP)
+	}
+
+	tun, tnet, err := netstack.CreateNetTUN(localAddr, cfg.Interface.DNS, int(cfg.Interface.MTU))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	bind := conn.NewDefaultBind()
+	if cfg.Interface.ListenPort != 0 {
+		_, err = bind.Open(cfg.Interface.ListenPort)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	if cfg.Interface.FwMark != 0 {
+		err = bind.SetMark(cfg.Interface.FwMark)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	dev := device.NewDevice(tun, bind, device.NewLogger(device.LogLevelError, ""))
+
+	uapi, err := cfg.ToUAPI()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err = dev.IpcSet(uapi); err != nil {
 		log.Fatal(err)
 	}
 	if err = dev.Up(); err != nil {
@@ -53,25 +73,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err = server.ListenAndServe("tcp", listen); err != nil {
+	lis := net.UDPAddr(cfg.Listen)
+	if err = server.ListenAndServe("tcp", (&lis).String()); err != nil {
 		log.Fatal(err)
 	}
-}
-
-func base64hex(s string) string {
-	bin, _ := base64.StdEncoding.DecodeString(s)
-	return hex.EncodeToString(bin)
-}
-
-type IPSlice []net.IP
-
-func (ss *IPSlice) String() string {
-	return fmt.Sprint(*ss)
-}
-
-func (ss *IPSlice) Set(value string) error {
-	*ss = append(*ss, net.ParseIP(value))
-	return nil
 }
 
 type resolver struct {
